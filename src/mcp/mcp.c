@@ -954,7 +954,7 @@ static bool is_project_db_file(const char *name, size_t len) {
 /* Open a .db file briefly, collect node/edge counts and root_path,
  * then append a JSON entry to arr. */
 static void build_project_json_entry(yyjson_mut_doc *doc, yyjson_mut_val *arr, const char *dir_path,
-                                     const char *name, size_t name_len, const struct stat *st) {
+                                     const char *name, size_t name_len, int64_t size_bytes) {
     char project_name[CBM_SZ_1K];
     snprintf(project_name, sizeof(project_name), "%.*s", (int)(name_len - 3), name);
 
@@ -986,7 +986,7 @@ static void build_project_json_entry(yyjson_mut_doc *doc, yyjson_mut_val *arr, c
     add_git_context_json(doc, p, root_path_buf[0] ? root_path_buf : NULL);
     yyjson_mut_obj_add_int(doc, p, "nodes", nodes);
     yyjson_mut_obj_add_int(doc, p, "edges", edges);
-    yyjson_mut_obj_add_int(doc, p, "size_bytes", (int64_t)st->st_size);
+    yyjson_mut_obj_add_int(doc, p, "size_bytes", size_bytes);
     yyjson_mut_arr_add_val(arr, p);
 }
 
@@ -1025,11 +1025,11 @@ static char *handle_list_projects(cbm_mcp_server_t *srv, const char *args) {
         }
         char full_path[CBM_SZ_2K];
         snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, name);
-        struct stat st;
-        if (stat(full_path, &st) != 0) {
+        int64_t size_bytes = cbm_file_size(full_path);
+        if (size_bytes < 0) {
             continue;
         }
-        build_project_json_entry(doc, arr, dir_path, name, len, &st);
+        build_project_json_entry(doc, arr, dir_path, name, len, size_bytes);
     }
     cbm_closedir(d);
 
@@ -2654,8 +2654,7 @@ static char *handle_cross_repo_mode(const char *repo_path, const char *args) {
 static void try_artifact_bootstrap(const char *project_name, const char *repo_path) {
     char db_buf[CBM_SZ_1K];
     project_db_path(project_name, db_buf, sizeof(db_buf));
-    struct stat db_st;
-    if (stat(db_buf, &db_st) != 0 && cbm_artifact_exists(repo_path)) {
+    if (cbm_file_size(db_buf) < 0 && cbm_artifact_exists(repo_path)) {
         cbm_log_info("index.artifact_bootstrap", "project", project_name);
         cbm_artifact_import(repo_path, db_buf);
     }
@@ -4546,8 +4545,7 @@ static void maybe_auto_index(cbm_mcp_server_t *srv) {
         char db_check[CBM_SZ_1K];
         snprintf(db_check, sizeof(db_check), "%s/%s.db", cbm_resolve_cache_dir(),
                  srv->session_project);
-        struct stat st;
-        if (stat(db_check, &st) == 0) {
+        if (cbm_file_size(db_check) >= 0) {
             /* Already indexed → register watcher for change detection */
             cbm_log_info("autoindex.skip", "reason", "already_indexed", "project",
                          srv->session_project);
