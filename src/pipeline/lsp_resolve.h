@@ -67,7 +67,17 @@ static inline const CBMResolvedCall *cbm_pipeline_find_lsp_resolution(
         }
         const char *short_name = strrchr(rc->callee_qn, '.');
         short_name = short_name ? short_name + SKIP_ONE : rc->callee_qn;
-        if (strcmp(short_name, call->callee_name) != 0) {
+        /* The call's callee_name is receiver-qualified for method/qualified
+         * calls ("c.inc", "A.Helper"); the LSP records the resolved
+         * class-qualified callee_qn ("Class.inc"). Compare the bare last
+         * segment on BOTH sides so method-dispatch resolutions join — the LSP
+         * already did the receiver->type resolution, and matching the full
+         * "c.inc" against "inc" would always miss, silently dropping the
+         * type-aware LSP strategy to the weaker textual registry. Free-function
+         * calls (bare callee_name) are unaffected. */
+        const char *call_short = strrchr(call->callee_name, '.');
+        call_short = call_short ? call_short + SKIP_ONE : call->callee_name;
+        if (strcmp(short_name, call_short) != 0) {
             continue;
         }
         if (!best || rc->confidence > best->confidence) {
