@@ -261,21 +261,30 @@ TEST(mem_rss_reflects_external_resident_memory) {
     ASSERT_NOT_NULL(mi_buf);
     memset(mi_buf, 0x11, warm);
 
-    const size_t region = (size_t)256 * 1024 * 1024;    /* 256 MB true RSS */
-    const size_t threshold = (size_t)128 * 1024 * 1024; /* generous half */
+    const size_t region = (size_t)256 * 1024 * 1024; /* 256 MB true RSS */
 
 #ifdef _WIN32
-    /* Windows current_rss (WorkingSetSize) is accurate; a plain resident
-     * allocation is reflected regardless of allocator. No Linux undercount. */
+    /* On Windows cbm_mem_rss() reads WorkingSetSize (GetProcessMemoryInfo),
+     * which the OS trims under memory pressure — so a touched region can drop
+     * out of the resident set (a stressed windows-11-arm runner kept only
+     * ~97 MB resident of a 256 MB touch). Re-touch the region immediately before
+     * measuring so its pages are freshly resident, and assert a threshold that
+     * survives aggressive trimming while staying far above the ~1 MB mimalloc
+     * warm buffer. This still guards the real regression — cbm_mem_rss()
+     * reporting a broken small counter instead of true resident memory — which
+     * the Linux #else branch exercises directly against the undercount. */
+    const size_t threshold = (size_t)32 * 1024 * 1024;
     void *big = malloc(region);
     ASSERT_NOT_NULL(big);
     memset(big, 0x5A, region);
+    memset(big, 0x5B, region); /* re-touch right before the measurement */
     size_t rss = cbm_mem_rss();
     ASSERT_GTE(rss, threshold);
     free(big);
 #else
     /* (2) Raw mmap bypasses mimalloc entirely: its committed counter does NOT
      * grow, but the true RSS does — this is what exposes the Linux undercount. */
+    const size_t threshold = (size_t)128 * 1024 * 1024; /* generous half of region */
     void *big = mmap(NULL, region, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     ASSERT_TRUE(big != MAP_FAILED);
     memset(big, 0x5A, region); /* fault every page in → resident */
