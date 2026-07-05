@@ -4,6 +4,8 @@
 name: Windows EXE
 
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
     inputs:
       version:
@@ -19,6 +21,10 @@ on:
 
 permissions:
   contents: read
+
+concurrency:
+  group: windows-exe-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -38,7 +44,7 @@ jobs:
             zip
 
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
-        if: ${{ inputs.with_ui }}
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.with_ui }}
         with:
           node-version: "22"
 
@@ -46,7 +52,7 @@ jobs:
         shell: msys2 {0}
         env:
           VERSION: ${{ inputs.version }}
-          WITH_UI: ${{ inputs.with_ui }}
+          WITH_UI: ${{ github.event_name != 'workflow_dispatch' || inputs.with_ui }}
         run: |
           set -euo pipefail
 
@@ -65,7 +71,7 @@ jobs:
       - name: Package artifact
         shell: msys2 {0}
         env:
-          WITH_UI: ${{ inputs.with_ui }}
+          WITH_UI: ${{ github.event_name != 'workflow_dispatch' || inputs.with_ui }}
         run: |
           set -euo pipefail
 
@@ -193,7 +199,7 @@ jobs:
           }
 
       - name: Verify embedded UI
-        if: ${{ inputs.with_ui }}
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.with_ui }}
         shell: pwsh
         run: |
           $out = Join-Path $env:RUNNER_TEMP "cbm-ui-out.log"
@@ -240,5 +246,5 @@ jobs:
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: ${{ inputs.with_ui && 'windows-exe-ui' || 'windows-exe-standard' }}
+          name: ${{ (github.event_name != 'workflow_dispatch' || inputs.with_ui) && 'windows-exe-ui' || 'windows-exe-standard' }}
           path: codebase-memory-mcp*-windows-amd64.zip
