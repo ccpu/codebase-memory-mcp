@@ -129,26 +129,52 @@ jobs:
           Write-Host "  downloads: none"
           Write-Host ""
 
-          $running = Get-Process -Name "codebase-memory-mcp" -ErrorAction SilentlyContinue
-          if ($running) {
-              Write-Host "Stopping running codebase-memory-mcp process(es)..."
-              $running | Stop-Process -Force -ErrorAction SilentlyContinue
-          }
-
           New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
           $Dest = Join-Path $InstallDir $BinName
 
+          $SourceHash = (Get-FileHash -Path $Source -Algorithm SHA256).Hash.ToLowerInvariant()
+          $AlreadyInstalled = $false
           if (Test-Path $Dest) {
-              $OldDest = "$Dest.old"
-              Remove-Item $OldDest -Force -ErrorAction SilentlyContinue
-              Rename-Item $Dest $OldDest -ErrorAction SilentlyContinue
+              $DestHash = (Get-FileHash -Path $Dest -Algorithm SHA256).Hash.ToLowerInvariant()
+              if ($DestHash -eq $SourceHash) {
+                  $AlreadyInstalled = $true
+              }
           }
 
-          Copy-Item $Source $Dest -Force
+          if ($AlreadyInstalled) {
+              Write-Host "Already installed: local binary matches artifact SHA-256."
+          } else {
+              $running = Get-Process -Name "codebase-memory-mcp" -ErrorAction SilentlyContinue
+              if ($running) {
+                  Write-Host "Stopping running codebase-memory-mcp process(es)..."
+                  $running | Stop-Process -Force -ErrorAction SilentlyContinue
+              }
+
+              if (Test-Path $Dest) {
+                  $OldDest = "$Dest.old"
+                  Remove-Item $OldDest -Force -ErrorAction SilentlyContinue
+                  Rename-Item $Dest $OldDest -ErrorAction SilentlyContinue
+              }
+
+              Copy-Item $Source $Dest -Force
+
+              $InstalledHash = (Get-FileHash -Path $Dest -Algorithm SHA256).Hash.ToLowerInvariant()
+              if ($InstalledHash -ne $SourceHash) {
+                  Write-Host "error: installed binary hash mismatch" -ForegroundColor Red
+                  Write-Host "  source:    $SourceHash"
+                  Write-Host "  installed: $InstalledHash"
+                  exit 1
+              }
+              Write-Host "Installed binary hash verified."
+          }
 
           try {
               $ver = & $Dest --version 2>&1
-              Write-Host "Installed: $ver"
+              if ($AlreadyInstalled) {
+                  Write-Host "Current: $ver"
+              } else {
+                  Write-Host "Installed: $ver"
+              }
           } catch {
               Write-Host "error: installed binary failed to run" -ForegroundColor Red
               exit 1
