@@ -8,6 +8,7 @@
 #include "../src/foundation/mem.h"
 #include "../src/foundation/arena.h"
 #include "../src/foundation/slab_alloc.h"
+#include "../src/foundation/compat_thread.h"
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
 #include "graph_buffer/graph_buffer.h"
@@ -16,6 +17,10 @@
 
 #include <stdatomic.h>
 #include <sys/stat.h>
+#include <mimalloc.h>
+#ifndef _WIN32
+#include <sys/mman.h>
+#endif
 
 /* ASan detection — mimalloc MI_OVERRIDE=0 under ASan, mi_process_info
  * may return 0 for RSS. Tests that depend on accurate RSS must skip. */
@@ -175,10 +180,23 @@ TEST(mem_rss_positive) {
 
 TEST(mem_peak_rss_gte_rss) {
     cbm_mem_init(0.5);
+    /* peak >= current RSS is definitional. Regression guard for the Linux
+     * statm-vs-ru_maxrss source mismatch: cbm_mem_rss() reads the live
+     * /proc/self/statm value (page-granular) while mimalloc's peak comes from
+     * getrusage ru_maxrss (KB-granular, and it lags), so a live current read
+     * could momentarily exceed the reported peak by a few pages and break the
+     * invariant. cbm_mem_peak_rss() now reconciles the two sources. Touch a
+     * fresh buffer so the check runs against a non-trivial live current read.
+     * (Linux-only bug — macOS reads both from mimalloc; it flaked on the
+     * Linux/ARM CI leg, which is the authoritative reproduction tier.) */
+    size_t n = 32 * 1024 * 1024;
+    char *p = (char *)malloc(n);
+    ASSERT_NOT_NULL(p);
+    memset(p, 0xBE, n); /* fault in all pages so current RSS is non-trivial */
     size_t rss = cbm_mem_rss();
     size_t peak = cbm_mem_peak_rss();
-    /* Peak must be >= current RSS */
     ASSERT_GTE(peak, rss);
+    free(p);
     PASS();
 }
 
@@ -203,6 +221,78 @@ TEST(mem_collect_no_crash) {
     cbm_mem_init(0.5);
     /* collect() must not crash even with nothing to collect */
     cbm_mem_collect();
+    PASS();
+}
+
+/* Reproduce-first guard for the Linux cbm_mem_rss() undercount (distilled
+ * from #776's 132460f5).
+ *
+ * On Linux, mimalloc's mi_process_info() never sets current_rss
+ * (vendored/mimalloc/src/prim/unix/prim.c only fills peak_rss from
+ * getrusage's ru_maxrss); current_rss silently keeps mi_process_info()'s
+ * default of pinfo.current_commit — mimalloc's OWN committed-page counter
+ * (stats.c:555). The UNFIXED cbm_mem_rss() returns that counter whenever it is
+ * nonzero, so on Linux it reports mimalloc-committed bytes, NOT true RSS. The
+ * FIXED code reads /proc/self/statm (os_rss) as the primary source → true RSS.
+ *
+ * The guard makes the two quantities DIVERGE deterministically:
+ *   1. mi_malloc() a small block (kept live) so mimalloc's committed counter is
+ *      a small POSITIVE value — this both defeats the UNFIXED `current_rss > 0`
+ *      fallback guard AND pins the reported value low. mi_malloc always routes
+ *      through mimalloc regardless of MI_OVERRIDE, so this works in the ASan
+ *      test-runner (MI_OVERRIDE=0) too.
+ *   2. Grow TRUE process RSS by ~256MB via a raw anonymous mmap — memory
+ *      mimalloc's committed counter never sees, but /proc/self/statm does.
+ * On UNFIXED Linux, cbm_mem_rss() then returns the ~few-MB committed counter
+ * (< 128MB) → this assertion FAILS (RED). On FIXED Linux it returns the /proc
+ * RSS (>= 256MB) → GREEN.
+ *
+ * macOS/Windows set current_rss from task_info/GetProcessMemoryInfo, which DO
+ * include the mapped+touched region, so cbm_mem_rss() is accurate there both
+ * before and after the fix — this passes on those platforms either way. The
+ * RED therefore manifests only on the Linux CI leg, which is exactly where the
+ * production undercount bit (backpressure/ceiling blinded). */
+TEST(mem_rss_reflects_external_resident_memory) {
+    cbm_mem_init(0.5);
+
+    /* (1) Pin mimalloc's committed-page counter to a small positive value. */
+    const size_t warm = (size_t)1 * 1024 * 1024; /* 1 MB via mimalloc */
+    void *mi_buf = mi_malloc(warm);
+    ASSERT_NOT_NULL(mi_buf);
+    memset(mi_buf, 0x11, warm);
+
+    const size_t region = (size_t)256 * 1024 * 1024; /* 256 MB true RSS */
+
+#ifdef _WIN32
+    /* On Windows cbm_mem_rss() reads WorkingSetSize (GetProcessMemoryInfo),
+     * which the OS trims under memory pressure — so a touched region can drop
+     * out of the resident set (a stressed windows-11-arm runner kept only
+     * ~97 MB resident of a 256 MB touch). Re-touch the region immediately before
+     * measuring so its pages are freshly resident, and assert a threshold that
+     * survives aggressive trimming while staying far above the ~1 MB mimalloc
+     * warm buffer. This still guards the real regression — cbm_mem_rss()
+     * reporting a broken small counter instead of true resident memory — which
+     * the Linux #else branch exercises directly against the undercount. */
+    const size_t threshold = (size_t)32 * 1024 * 1024;
+    void *big = malloc(region);
+    ASSERT_NOT_NULL(big);
+    memset(big, 0x5A, region);
+    memset(big, 0x5B, region); /* re-touch right before the measurement */
+    size_t rss = cbm_mem_rss();
+    ASSERT_GTE(rss, threshold);
+    free(big);
+#else
+    /* (2) Raw mmap bypasses mimalloc entirely: its committed counter does NOT
+     * grow, but the true RSS does — this is what exposes the Linux undercount. */
+    const size_t threshold = (size_t)128 * 1024 * 1024; /* generous half of region */
+    void *big = mmap(NULL, region, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ASSERT_TRUE(big != MAP_FAILED);
+    memset(big, 0x5A, region); /* fault every page in → resident */
+    size_t rss = cbm_mem_rss();
+    ASSERT_GTE(rss, threshold);
+    munmap(big, region);
+#endif
+    mi_free(mi_buf);
     PASS();
 }
 
@@ -544,6 +634,124 @@ TEST(slab_mixed_alloc_free_stress) {
     PASS();
 }
 
+/* ── Cross-thread slab-free safety (distilled from PR #782, closes #852) ──
+ *
+ * Tree-sitter's allocator callbacks are process-global: a ≤64B chunk allocated
+ * on parser thread A can be freed on parser thread B. The pre-fix thread-local
+ * slab_owns() only scanned the FREEING thread's pages, so a cross-thread free
+ * missed A's pages and fell through to free() on a pointer INTERIOR to a
+ * malloc'd page (invalid free / SIGABRT). Separately (#852), destroying/
+ * reclaiming a thread's slab while a live chunk is still referenced by a
+ * tree-sitter lexer freed the page under it (heap-use-after-free).
+ *
+ * These are RED on main (invalid free / UAF, caught by ASan) and GREEN with
+ * the O(1) aligned-page + retire-on-live-count allocator. */
+
+typedef struct {
+    void *ptr;
+    atomic_int *go;
+} slab_cross_thread_free_ctx_t;
+
+static void *slab_cross_thread_free_worker(void *arg) {
+    slab_cross_thread_free_ctx_t *ctx = (slab_cross_thread_free_ctx_t *)arg;
+    while (ctx->go && !atomic_load_explicit(ctx->go, memory_order_acquire)) {
+        cbm_usleep(1000);
+    }
+    /* Free on a DIFFERENT thread than the one that allocated. On main this
+     * falls through to free() on an interior slab pointer → invalid free. */
+    cbm_slab_test_free(ctx->ptr);
+    return NULL;
+}
+
+/* #852 exact guard — deterministic, single-thread, NOT cross-suite-order
+ * dependent. Destroy the current thread's slab while a chunk is still live,
+ * then read and free the chunk. On main, destroy frees the page → the read is
+ * a heap-use-after-free and the free is an invalid free. With retire-on-
+ * live-count the page is retired (not freed) while the chunk lives and released
+ * only when the final chunk returns. */
+TEST(slab_destroy_thread_with_live_chunk_no_uaf) {
+    cbm_slab_install();
+
+    void *p = cbm_slab_test_malloc(48); /* ≤64B → slab chunk */
+    ASSERT_NOT_NULL(p);
+    memset(p, 0x7E, 48);
+
+    /* Tear down slab TLS with p still referenced (models the live lexer). */
+    cbm_slab_destroy_thread();
+
+    /* p must still be valid — its page is retired, not freed. */
+    for (int i = 0; i < 48; i++) {
+        ASSERT_EQ(((unsigned char *)p)[i], 0x7E);
+    }
+
+    /* Returning the last live chunk releases the retired page (no leak). */
+    cbm_slab_test_free(p);
+    PASS();
+}
+
+TEST(slab_cross_thread_free_is_safe) {
+    cbm_slab_install();
+
+    void *p = cbm_slab_test_malloc(32);
+    ASSERT_NOT_NULL(p);
+    memset(p, 0x5A, 32);
+
+    atomic_int go;
+    atomic_init(&go, 1);
+    slab_cross_thread_free_ctx_t ctx = {.ptr = p, .go = &go};
+    cbm_thread_t t;
+    ASSERT_EQ(cbm_thread_create(&t, 0, slab_cross_thread_free_worker, &ctx), 0);
+    ASSERT_EQ(cbm_thread_join(&t), 0);
+
+    cbm_slab_destroy_thread();
+    PASS();
+}
+
+TEST(slab_reclaim_with_foreign_live_chunk_is_safe) {
+    cbm_slab_install();
+
+    void *p = cbm_slab_test_malloc(32);
+    ASSERT_NOT_NULL(p);
+    memset(p, 0xA5, 32);
+
+    atomic_int go;
+    atomic_init(&go, 0);
+    slab_cross_thread_free_ctx_t ctx = {.ptr = p, .go = &go};
+    cbm_thread_t t;
+    ASSERT_EQ(cbm_thread_create(&t, 0, slab_cross_thread_free_worker, &ctx), 0);
+
+    /* Reclaim while another thread still owns a live chunk from our page.
+     * On main, reclaim frees the page → the pending cross-thread free is a
+     * use-after-free. With retire-on-live-count, the page is retired. */
+    cbm_slab_reclaim();
+    atomic_store_explicit(&go, 1, memory_order_release);
+    ASSERT_EQ(cbm_thread_join(&t), 0);
+
+    cbm_slab_destroy_thread();
+    PASS();
+}
+
+TEST(slab_destroy_with_foreign_live_chunk_is_safe) {
+    cbm_slab_install();
+
+    void *p = cbm_slab_test_malloc(32);
+    ASSERT_NOT_NULL(p);
+    memset(p, 0x3C, 32);
+
+    atomic_int go;
+    atomic_init(&go, 0);
+    slab_cross_thread_free_ctx_t ctx = {.ptr = p, .go = &go};
+    cbm_thread_t t;
+    ASSERT_EQ(cbm_thread_create(&t, 0, slab_cross_thread_free_worker, &ctx), 0);
+
+    /* Destroy TLS while another thread still owns a live chunk. */
+    cbm_slab_destroy_thread();
+    atomic_store_explicit(&go, 1, memory_order_release);
+    ASSERT_EQ(cbm_thread_join(&t), 0);
+
+    PASS();
+}
+
 /* ── Parallel extraction integration test ──────────────────── */
 
 static char g_mem_tmpdir[256];
@@ -829,6 +1037,7 @@ SUITE(mem) {
     RUN_TEST(mem_rss_positive);
     RUN_TEST(mem_peak_rss_gte_rss);
     RUN_TEST(mem_rss_increases_after_alloc);
+    RUN_TEST(mem_rss_reflects_external_resident_memory);
     RUN_TEST(mem_collect_no_crash);
     RUN_TEST(mem_collect_rss_still_positive);
     /* Memory pressure simulation */
@@ -852,6 +1061,11 @@ SUITE(mem) {
     RUN_TEST(slab_realloc_slab_to_heap);
     RUN_TEST(slab_calloc_zeroed);
     RUN_TEST(slab_mixed_alloc_free_stress);
+    /* Cross-thread free safety + retire-on-live-count (#782 / #852) */
+    RUN_TEST(slab_destroy_thread_with_live_chunk_no_uaf);
+    RUN_TEST(slab_cross_thread_free_is_safe);
+    RUN_TEST(slab_reclaim_with_foreign_live_chunk_is_safe);
+    RUN_TEST(slab_destroy_with_foreign_live_chunk_is_safe);
     /* Integration */
     RUN_TEST(parallel_extract_without_source_retention);
     RUN_TEST(parallel_extract_tiny_source_retention_budget);

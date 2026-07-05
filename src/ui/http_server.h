@@ -55,4 +55,16 @@ void cbm_http_server_set_binary_path(const char *path);
 /* Resolve argv[0] into an executable path suitable for subprocess spawning. */
 bool cbm_http_server_resolve_binary_path(const char *argv0, char *out, size_t outsz);
 
+/* Pure git-remote URL helpers used by GET /api/repo-info. Exposed for tests. */
+
+/* Normalize a git remote (scp-style / ssh:// / https://) to a canonical
+ * "https://host/org/repo" web base, with trailing ".git" and any embedded
+ * credentials removed. malloc'd or NULL. Caller frees. */
+char *cbm_ui_git_web_base(const char *url);
+
+/* Copy `url` with any "user[:password]@" userinfo stripped from a
+ * scheme://authority URL (scp-style is left unchanged). malloc'd, or NULL when
+ * `url` is NULL. Caller frees. */
+char *cbm_ui_git_strip_credentials(const char *url);
+
 #endif /* CBM_UI_HTTP_SERVER_H */
