@@ -15,7 +15,7 @@ on:
         description: "Build the embedded UI variant. This runs npm ci."
         required: false
         type: boolean
-        default: false
+        default: true
 
 permissions:
   contents: read
@@ -192,7 +192,53 @@ jobs:
             exit 1
           }
 
+      - name: Verify embedded UI
+        if: ${{ inputs.with_ui }}
+        shell: pwsh
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP "cbm-ui-out.log"
+          $err = Join-Path $env:RUNNER_TEMP "cbm-ui-err.log"
+          $process = Start-Process -FilePath "$PWD\codebase-memory-mcp.exe" `
+            -ArgumentList @("--ui=true", "--port=9749") `
+            -RedirectStandardOutput $out `
+            -RedirectStandardError $err `
+            -WindowStyle Hidden `
+            -PassThru
+
+          try {
+            $ok = $false
+            for ($i = 0; $i -lt 30; $i++) {
+              if ($process.HasExited) {
+                break
+              }
+              try {
+                $response = Invoke-WebRequest -Uri "http://127.0.0.1:9749/" -UseBasicParsing -TimeoutSec 2
+                if ($response.StatusCode -eq 200 -and $response.Content -match "<html|<div|script") {
+                  $ok = $true
+                  break
+                }
+              } catch {
+                Start-Sleep -Seconds 1
+              }
+            }
+
+            if (-not $ok) {
+              Write-Host "=== UI stdout ==="
+              if (Test-Path $out) { Get-Content $out }
+              Write-Host "=== UI stderr ==="
+              if (Test-Path $err) { Get-Content $err }
+              Write-Host "BLOCKED: built binary did not serve the embedded UI on http://127.0.0.1:9749/"
+              exit 1
+            }
+
+            Write-Host "Embedded UI verified at http://127.0.0.1:9749/"
+          } finally {
+            if (-not $process.HasExited) {
+              Stop-Process -Id $process.Id -Force
+            }
+          }
+
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: windows-exe
+          name: ${{ inputs.with_ui && 'windows-exe-ui' || 'windows-exe-standard' }}
           path: codebase-memory-mcp*-windows-amd64.zip
